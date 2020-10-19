@@ -42,57 +42,93 @@ class ThreadPool
 {
 private:
 	/* thread vector and task queue */
-	std::vector<std::thread>			mWorkers;
-	std::queue<std::function<void()>>	mTasks;
-	/* synchronizatin */
-	std::mutex							mQueueMutex;
-	std::condition_variable				mCondition;
-	bool								mStopped;
+	std::vector<std::thread>			mWorkerVector;
+	std::queue<std::function<void()>>	mTaskQueue;
+
+	std::mutex							mMutex;			// The main mutex.
+	std::condition_variable				mCondition;		// Synchronization.
+	bool								mStopped;		// The flag that all threads stop.
+
+	std::mutex							mInFlightMutex;
+	std::condition_variable				mInFlightCondition;
+	std::atomic<std::size_t>			mInFlight;
 
 public:
-	ThreadPool(size_t);
+	explicit ThreadPool(size_t threads = (std::max)(2u, std::thread::hardware_concurrency() * 2));
 	~ThreadPool();
 
 	template<class F, class... Args>
-	auto Enqueque(F&& f, Args&&... args)->std::future<typename std::result_of<F(Args...)>::type>;
+	auto Enqueue(F&& f, Args&&... args)->std::future<typename std::result_of<F(Args...)>::type>;
+
+	inline void WaitUntilTasksEmpty();
+	inline void WaitUntilNothingInFlight();
+
+private:
+	struct HandleInFlight
+	{
+		ThreadPool& threadPool;
+
+		HandleInFlight(ThreadPool& tp)
+			: threadPool(tp)
+		{
+			std::atomic_fetch_add_explicit(&threadPool.mInFlight,
+								  std::size_t(1),
+								  std::memory_order_relaxed);
+		}
+
+		~HandleInFlight()
+		{
+			std::size_t prev = std::atomic_fetch_sub_explicit(&threadPool.mInFlight,
+													 std::size_t(1),
+													 std::memory_order_consume);
+			if (prev == 1) {
+				threadPool.mInFlightCondition.notify_all();
+			}
+		}
+	};
 };
 
 /****************************************************************************************
  * The constructor
  * 
- * Depending how many worker threads we initilized.
+ * Depending how many worker threads we initialize at first.
 *****************************************************************************************/
 ThreadPool::ThreadPool(size_t threads)
 	: mStopped(false)
+	, mInFlight(0)
 {
 	for (size_t i = 0; i < threads; i++)
 	{
-		mWorkers.emplace_back(
+		mWorkerVector.emplace_back(
 			[this]
 			{
 				while (true)
 				{
 					std::function<void()> task;
+					bool isEmpty;
 					{
-						std::unique_lock<std::mutex> lock(this->mQueueMutex);
-						this->mCondition.wait(lock, [this] {
-							return this->mStopped || !this->mTasks.empty();
-						});
-						
-						if (this->mStopped && this->mTasks.empty())
-						{
+						std::unique_lock<std::mutex> lock(this->mMutex);
+						this->mCondition.wait(lock, [this] { return this->mStopped || !this->mTaskQueue.empty(); });
+
+						if (this->mStopped && this->mTaskQueue.empty()) {
 							return;
 						}
 
-						task = std::move(this->mTasks.front());
-						this->mTasks.pop();
+						task = std::move(this->mTaskQueue.front());
+						this->mTaskQueue.pop();
+						isEmpty = this->mTaskQueue.empty();
 					}
 
+					if (isEmpty) {
+						mCondition.notify_all();
+					}
+
+					HandleInFlight(*this);
 					task();
-				}				
+				}
 			}
 		);
-	}	
+	}
 }
 
 /****************************************************************************************
@@ -103,35 +139,45 @@ ThreadPool::ThreadPool(size_t threads)
 ThreadPool::~ThreadPool()
 {
 	{
-		std::unique_lock<std::mutex> lock(mQueueMutex);
+		std::unique_lock<std::mutex> lock(mMutex);
 		mStopped = true;
 	}
 
 	mCondition.notify_all();
 
-	for (std::thread& worker : mWorkers)
+	for (std::thread& worker : mWorkerVector)
 	{
 		worker.join();
 	}
 }
 
+/****************************************************************************************
+ * Method Enqueue
+ *
+ * @brief:			Insert the function that the worker thread calls.
+ *
+ * @param f:		The function that the worker thread calls.
+ * @param args:		The parameter(s) that the function calls.
+ *
+ * @return void
+*****************************************************************************************/
 template<class F, class... Args>
-auto ThreadPool::Enqueque(F&& f, Args&&... args)->std::future<typename std::result_of<F(Args...)>::type>
+auto ThreadPool::Enqueue(F&& f, Args&&... args)->std::future<typename std::result_of<F(Args...)>::type>
 {
 	using returnType = typename std::result_of<F(Args...)>::type;
 
-	auto task = std::make_shared<std::packaged_task<returnType()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+	auto task = std::make_shared<std::packaged_task<returnType()>>(
+			std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 
 	std::future<returnType> res = task->get_future();
 	{
-		std::unique_lock<std::mutex> lock(mQueueMutex);
+		std::unique_lock<std::mutex> lock(mMutex);
 
-		if (mStopped)
-		{
+		if (mStopped) {
 			throw std::runtime_error("Enqueue on stopped ThreadPool.");
 		}
 
-		mTasks.emplace([task](){ (*task)(); });
+		mTaskQueue.emplace([task](){ (*task)(); });
 	}
 
 	mCondition.notify_one();
@@ -139,6 +185,32 @@ auto ThreadPool::Enqueque(F&& f, Args&&... args)->std::future<typename std::resu
 	return res;
 }
 
+/****************************************************************************************
+ * Method WaitUntilTasksEmpty
+ *
+ * @brief:			Waiting until the task queue is empty.
+ *
+ * @return void
+*****************************************************************************************/
+inline void ThreadPool::WaitUntilTasksEmpty()
+{
+	std::unique_lock<std::mutex> lock(mMutex);
+	mCondition.wait(lock, [this]{ return this->mTaskQueue.empty(); });
 }
+
+/****************************************************************************************
+ * Method WaitUntilNothingInFlight
+ *
+ * @brief:			Waiting until nothing in thread pool is in flight.
+ *
+ * @return void
+*****************************************************************************************/
+inline void ThreadPool::WaitUntilNothingInFlight()
+{
+	std::unique_lock<std::mutex> lock(mInFlightMutex);
+	mInFlightCondition.wait(lock, [this]{ return (this->mInFlight == 0); });
+}
+
+} // end namespace Stephen
 
 #endif//__STEPHEN_THREAD_POOL_H__
